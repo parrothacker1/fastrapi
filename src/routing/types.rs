@@ -4,6 +4,20 @@ use pyo3::{Py, PyAny};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(usize)]
+pub enum HttpMethod {
+    GET = 0,
+    POST = 1,
+    PUT = 2,
+    DELETE = 3,
+    PATCH = 4,
+    OPTIONS = 5,
+    HEAD = 6,
+}
+
+pub const HTTP_METHOD_COUNT: usize = 7;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ParameterSource {
     Path,
@@ -65,4 +79,20 @@ pub struct RouteHandler {
     pub body_param_names: Vec<String>,
     pub dependencies: Vec<DependencyNode>,
     pub parsed_params: Vec<ParsedParameter>,
+}
+
+pub struct RouteEntry {
+    pub method: HttpMethod,
+    pub path: String,
+    pub handler: Arc<RouteHandler>,
+    pub tags: Vec<String>,
+    pub summary: Option<String>,
+    pub description: Option<String>,
+    pub deprecated: Option<bool>,
+    pub include_in_schema: bool,
+}
+
+pub struct WebSocketEntry {
+    pub path: String,
+    pub handler: Py<PyAny>,
 }

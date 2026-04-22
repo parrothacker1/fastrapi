@@ -96,3 +96,9 @@ pub struct WebSocketEntry {
     pub path: String,
     pub handler: Py<PyAny>,
 }
+
+pub struct SubRouterMount {
+    pub router: Py<PyAny>,
+    pub prefix: String,
+    pub tags: Vec<String>,
+}

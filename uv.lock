@@ -22,7 +22,7 @@ wheels = [
 [[package]]
 name = "fastrapi"
 version = "0.2.10"
-source = { editable = "." }
+source = { virtual = "." }
 
 [package.optional-dependencies]
 pydantic = [

@@ -49,3 +49,6 @@ repository = "https://github.com/ppmpreetham/fastrapi.git"
 
 [tool.maturin]
 features = ["pyo3/extension-module"]
+
+[tool.uv]
+package = false

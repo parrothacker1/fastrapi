@@ -512,6 +512,7 @@ fn build_router(
     let base_router = app_config.router.bind(py);
     let base_ref = base_router.borrow();
     let (routes, ws_routes) = base_ref.flatten(py);
+    base_ref.freeze(py);
 
     for route in routes {
         app = register_route(

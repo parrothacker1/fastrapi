@@ -1,10 +1,13 @@
+use crate::routing::types::{
+    FlatRoute, FlatWebSocket, HttpMethod, RouteEntry, SubRouterMount, WebSocketEntry,
+};
 use pyo3::prelude::{pyclass, pymethods, Bound, Py, PyAny, PyAnyMethods, PyResult, Python};
 use pyo3::types::{PyCFunction, PyDict, PyTuple};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::routing::types::{HttpMethod, RouteEntry, SubRouterMount, WebSocketEntry};
-
-#[pyclass(name = "APIRouter")]
+#[pyclass(name = "APIRouter", skip_from_py_object)]
+#[derive(Clone)]
 pub struct PyAPIRouter {
     #[pyo3(get)]
     pub prefix: String,
@@ -27,9 +30,29 @@ pub struct PyAPIRouter {
     pub route_entries: Arc<Mutex<Vec<RouteEntry>>>,
     pub websocket_entries: Arc<Mutex<Vec<WebSocketEntry>>>,
     pub sub_routers: Arc<Mutex<Vec<SubRouterMount>>>,
+    pub frozen: Arc<AtomicBool>,
+    pub cached_flat: Arc<Mutex<Option<(Vec<FlatRoute>, Vec<FlatWebSocket>)>>>,
 }
 
 impl PyAPIRouter {
+    pub fn new_() -> Self {
+        Self {
+            prefix: String::new(),
+            tags: Vec::new(),
+            responses: None,
+            dependencies: None,
+            deprecated: None,
+            include_in_schema: true,
+            default_response_class: None,
+            generate_unique_id_function: None,
+
+            route_entries: Arc::new(Mutex::new(Vec::new())),
+            websocket_entries: Arc::new(Mutex::new(Vec::new())),
+            sub_routers: Arc::new(Mutex::new(Vec::new())),
+            frozen: Arc::new(AtomicBool::new(false)),
+            cached_flat: Arc::new(Mutex::new(None)),
+        }
+    }
     pub fn create_method_decorator(
         &self,
         py: Python<'_>,
@@ -41,6 +64,11 @@ impl PyAPIRouter {
         deprecated: Option<bool>,
         include_in_schema: bool,
     ) -> PyResult<Py<PyAny>> {
+        if self.frozen.load(Ordering::Relaxed) {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "Cannot modify router after it has been frozen",
+            ));
+        }
         let mut merged_tags = self.tags.clone();
         if let Some(route_tags) = tags {
             let tag_list = route_tags.bind(py);
@@ -101,6 +129,11 @@ impl PyAPIRouter {
     }
 
     pub fn create_ws_decorator(&self, py: Python<'_>, path: String) -> PyResult<Py<PyAny>> {
+        if self.frozen.load(Ordering::Relaxed) {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "Cannot modify router after it has been frozen",
+            ));
+        }
         if !path.starts_with('/') {
             return Err(pyo3::exceptions::PyValueError::new_err(
                 "WebSocket path must start with '/'",
@@ -120,6 +153,30 @@ impl PyAPIRouter {
             Ok(func)
         };
         PyCFunction::new_closure(py, None, None, closure).map(|f| f.into())
+    }
+    pub fn freeze(&self, py: Python<'_>) {
+        if self.frozen.load(Ordering::Relaxed) {
+            return;
+        }
+
+        let flat = flatten_router(py, self);
+
+        *self.cached_flat.lock().unwrap() = Some(flat);
+
+        self.frozen.store(true, Ordering::Relaxed);
+    }
+    pub fn flatten(&self, py: Python<'_>) -> (Vec<FlatRoute>, Vec<FlatWebSocket>) {
+        if self.frozen.load(Ordering::Relaxed) {
+            return self
+                .cached_flat
+                .lock()
+                .unwrap()
+                .as_ref()
+                .expect("Router frozen but no cache")
+                .clone();
+        }
+
+        flatten_router(py, self)
     }
 }
 
@@ -161,6 +218,8 @@ impl PyAPIRouter {
             route_entries: Arc::new(Mutex::new(Vec::new())),
             websocket_entries: Arc::new(Mutex::new(Vec::new())),
             sub_routers: Arc::new(Mutex::new(Vec::new())),
+            frozen: Arc::new(AtomicBool::new(false)),
+            cached_flat: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -460,10 +519,15 @@ impl PyAPIRouter {
     fn include_router(
         &self,
         py: Python<'_>,
-        router: Py<PyAny>,
+        router: Py<PyAPIRouter>,
         prefix: String,
         tags: Option<Py<PyAny>>,
     ) -> PyResult<()> {
+        if self.frozen.load(Ordering::Relaxed) {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "Cannot modify router after it has been frozen",
+            ));
+        }
         let tag_vec: Vec<String> = if let Some(ref tags_obj) = tags {
             let tags_bound = tags_obj.bind(py);
             if let Ok(iter) = tags_bound.try_iter() {
@@ -475,13 +539,87 @@ impl PyAPIRouter {
         } else {
             Vec::new()
         };
-
         self.sub_routers.lock().unwrap().push(SubRouterMount {
-            router: router.clone_ref(py),
+            router: router,
             prefix,
             tags: tag_vec,
         });
 
         Ok(())
+    }
+}
+
+fn flatten_router(py: Python<'_>, root: &PyAPIRouter) -> (Vec<FlatRoute>, Vec<FlatWebSocket>) {
+    let mut routes = Vec::new();
+    let mut ws_routes = Vec::new();
+    let mut stack = vec![(root.clone(), String::new(), Vec::<String>::new())];
+
+    while let Some((router, prefix, parent_tags)) = stack.pop() {
+        let router_prefix = router.prefix.clone();
+        let full_prefix = join_path(&prefix, &router_prefix);
+
+        let mut current_tags = parent_tags.clone();
+        for tag in &router.tags {
+            if !current_tags.contains(tag) {
+                current_tags.push(tag.clone());
+            }
+        }
+
+        let route_entries = {
+            let guard = router.route_entries.lock().unwrap();
+            guard.clone()
+        };
+        for entry in route_entries {
+            let full_path = join_path(&full_prefix, &entry.path);
+            let mut tags = current_tags.clone();
+            for tag in &entry.tags {
+                if !tags.contains(tag) {
+                    tags.push(tag.clone());
+                }
+            }
+            routes.push(FlatRoute {
+                method: entry.method,
+                path: full_path,
+                handler: entry.handler.clone(),
+                tags,
+            });
+        }
+
+        let ws_entries = {
+            let guard = router.websocket_entries.lock().unwrap();
+            guard.clone()
+        };
+        for ws in ws_entries {
+            let full_path = join_path(&full_prefix, &ws.path);
+            ws_routes.push(FlatWebSocket {
+                path: full_path,
+                handler: ws.handler.clone_ref(py),
+            });
+        }
+
+        let subs = {
+            let guard = router.sub_routers.lock().unwrap();
+            guard.clone()
+        };
+        for sub in subs {
+            let sub_router = sub.router.bind(py).borrow();
+            let mut sub_tags = current_tags.clone();
+            for tag in &sub.tags {
+                if !sub_tags.contains(tag) {
+                    sub_tags.push(tag.clone());
+                }
+            }
+            let sub_prefix = join_path(&full_prefix, &sub.prefix);
+            stack.push((sub_router.clone(), sub_prefix, sub_tags));
+        }
+    }
+    (routes, ws_routes)
+}
+
+fn join_path(a: &str, b: &str) -> String {
+    match (a.ends_with('/'), b.starts_with('/')) {
+        (true, true) => format!("{}{}", &a[..a.len() - 1], b),
+        (false, false) => format!("{}/{}", a, b),
+        _ => format!("{}{}", a, b),
     }
 }

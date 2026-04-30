@@ -1,11 +1,9 @@
 use crate::ffi::exceptions::PyHTTPException;
 use crate::ffi::pydantic;
-use crate::globals::ROUTES;
 use crate::http::request::PyRequest;
 use crate::http::responses::convert_response_by_type;
 use crate::routing::dependencies::{self, DependencyExecutionError};
 use crate::routing::types::{RequestInput, RouteHandler};
-use crate::utils::utils::local_guard;
 use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -15,11 +13,6 @@ use pyo3::types::PyDict;
 use std::sync::Arc;
 
 type DependencyResults = std::collections::HashMap<String, Arc<Py<PyAny>>>;
-
-fn load_handler(route_key: &Arc<str>) -> Option<Arc<RouteHandler>> {
-    let guard = local_guard(&*ROUTES);
-    ROUTES.get(route_key.as_ref(), &guard).cloned()
-}
 
 fn python_error_to_response(py: Python<'_>, err: PyErr) -> Response {
     if let Ok(http_error) = err.value(py).extract::<PyRef<'_, PyHTTPException>>() {
@@ -207,15 +200,10 @@ async fn call_async_handler(
 
 pub async fn run_py_handler_with_request(
     rt_handle: tokio::runtime::Handle,
-    route_key: Arc<str>,
+    handler: Arc<RouteHandler>,
     request_input: RequestInput,
     payload: Option<serde_json::Value>,
 ) -> Response {
-    let handler = match load_handler(&route_key) {
-        Some(h) => h,
-        None => return StatusCode::NOT_FOUND.into_response(),
-    };
-
     if !handler.is_async && handler.dependencies.is_empty() {
         return rt_handle
             .spawn_blocking(move || {
@@ -276,13 +264,8 @@ pub async fn run_py_handler_with_request(
 
 pub async fn run_py_handler_no_args(
     rt_handle: tokio::runtime::Handle,
-    route_key: Arc<str>,
+    handler: Arc<RouteHandler>,
 ) -> Response {
-    let handler = match load_handler(&route_key) {
-        Some(handler) => handler,
-        None => return StatusCode::NOT_FOUND.into_response(),
-    };
-
     if handler.is_async {
         call_async_handler(rt_handle, handler, None, None).await
     } else {

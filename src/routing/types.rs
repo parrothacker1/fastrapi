@@ -1,3 +1,4 @@
+use crate::router::PyAPIRouter;
 use crate::routing::dependencies::DependencyNode;
 use crate::types::response::ResponseType;
 use pyo3::{Py, PyAny};
@@ -14,6 +15,20 @@ pub enum HttpMethod {
     PATCH = 4,
     OPTIONS = 5,
     HEAD = 6,
+}
+
+impl HttpMethod {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            HttpMethod::GET => "GET",
+            HttpMethod::POST => "POST",
+            HttpMethod::PUT => "PUT",
+            HttpMethod::DELETE => "DELETE",
+            HttpMethod::PATCH => "PATCH",
+            HttpMethod::OPTIONS => "OPTIONS",
+            HttpMethod::HEAD => "HEAD",
+        }
+    }
 }
 
 pub const HTTP_METHOD_COUNT: usize = 7;
@@ -81,6 +96,7 @@ pub struct RouteHandler {
     pub parsed_params: Vec<ParsedParameter>,
 }
 
+#[derive(Clone)]
 pub struct RouteEntry {
     pub method: HttpMethod,
     pub path: String,
@@ -92,13 +108,29 @@ pub struct RouteEntry {
     pub include_in_schema: bool,
 }
 
+#[derive(Clone)]
 pub struct WebSocketEntry {
     pub path: String,
     pub handler: Py<PyAny>,
 }
 
+#[derive(Clone)]
 pub struct SubRouterMount {
-    pub router: Py<PyAny>,
+    pub router: Py<PyAPIRouter>,
     pub prefix: String,
     pub tags: Vec<String>,
+}
+
+#[derive(Clone)]
+pub struct FlatRoute {
+    pub method: HttpMethod,
+    pub path: String,
+    pub handler: Arc<RouteHandler>,
+    pub tags: Vec<String>,
+}
+
+#[derive(Clone)]
+pub struct FlatWebSocket {
+    pub path: String,
+    pub handler: Py<PyAny>,
 }

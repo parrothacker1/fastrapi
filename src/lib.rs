@@ -18,7 +18,7 @@ pub use ffi::exceptions;
 pub use ffi::py_handlers;
 pub use ffi::pydantic;
 pub use ffi::router;
-pub use globals::{config, BASEMODEL_TYPE, MIDDLEWARES, PYTHON_RUNTIME, ROUTES, WEBSOCKET_ROUTES};
+pub use globals::{config, BASEMODEL_TYPE, MIDDLEWARES, PYTHON_RUNTIME};
 pub use http::middleware;
 pub use http::request;
 pub use http::responses;
@@ -107,11 +107,6 @@ fn fastrapi(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     submodule!(m, "middleware.cors", add_classes!(CORSMiddleware));
     submodule!(m, "websocket", add_classes!(PyWebSocket));
-    let ws_mod = m.getattr("websocket")?.cast_into::<PyModule>()?;
-    ws_mod.add_function(wrap_pyfunction!(
-        crate::http::websocket::websocket,
-        &ws_mod
-    )?)?;
 
     status::create_status_submodule(m)?;
     pydantic::register_pydantic_integration(m)?;

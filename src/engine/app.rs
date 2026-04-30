@@ -6,14 +6,13 @@ use tracing::info;
 
 use super::server;
 pub use super::types::FastrAPI;
-use crate::ffi::pydantic::parse_route_metadata;
-use crate::globals::{MIDDLEWARES, ROUTES};
+use crate::globals::MIDDLEWARES;
 use crate::http::middleware::{
     parse_cors_params, parse_gzip_params, parse_session_params, parse_trusted_host_params,
     PyMiddleware,
 };
-use crate::http::websocket::websocket as ws_decorator;
-use crate::routing::types::RouteHandler;
+use crate::router::PyAPIRouter;
+use crate::routing::types::HttpMethod;
 
 #[pymethods]
 impl FastrAPI {
@@ -96,21 +95,20 @@ impl FastrAPI {
         separate_input_output_schemas: bool,
         openapi_external_docs: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
-        let default_response_class = match default_response_class {
-            Some(cls) => cls,
-            None => py
-                .import(intern!(py, "fastrapi"))?
-                .getattr(intern!(py, "responses"))?
-                .getattr(intern!(py, "JSONResponse"))?
-                .unbind(),
-        };
-
+        let default_response_class = default_response_class.unwrap_or_else(|| {
+            py.import(intern!(py, "fastrapi"))
+                .and_then(|m| m.getattr(intern!(py, "responses")))
+                .and_then(|r| r.getattr(intern!(py, "JSONResponse")))
+                .map(|obj| obj.unbind())
+                .unwrap()
+        });
         let generate_unique_id_function = match generate_unique_id_function {
             Some(func) => func,
             None => py
                 .eval(c"lambda route: route.__name__", None, None)?
                 .unbind(),
         };
+        let base_router = Py::new(py, PyAPIRouter::new_())?;
 
         Ok(Self {
             debug,
@@ -153,6 +151,7 @@ impl FastrAPI {
             trusted_host_config: None,
             gzip_config: None,
             session_config: None,
+            router: base_router,
         })
     }
 
@@ -166,16 +165,7 @@ impl FastrAPI {
         let class_name_obj = middleware_class.bind(py).getattr(intern!(py, "__name__"))?;
         let class_name = class_name_obj.cast::<PyString>()?.to_str()?.to_owned();
 
-        // lazy dict if no kwargs
-        let default_dict;
-        let opts = match kwargs {
-            Some(dict) => dict,
-            None => {
-                default_dict = PyDict::new(py);
-                &default_dict
-            }
-        };
-
+        let opts = &kwargs.map(|d| d.clone()).unwrap_or_else(|| PyDict::new(py));
         match class_name.as_str() {
             "CORSMiddleware" => {
                 self.cors_config = Some(parse_cors_params(opts)?);
@@ -205,49 +195,297 @@ impl FastrAPI {
     }
 
     // wish these methods could be abstracted away by macros, but PyO3 doesn't support dynamic method creation or macros in impl blocks, so here we are :(
-    #[pyo3(signature = (path))]
-    fn get<'py>(&self, path: String, py: Python<'py>) -> PyResult<Py<PyAny>> {
-        self.create_decorator("GET", path, py)
+
+    #[pyo3(signature = (path, *, response_model=None, status_code=None, tags=None, dependencies=None, summary=None, description=None, response_description=None, responses=None, deprecated=None, operation_id=None, response_model_include=None, response_model_exclude=None, response_model_by_alias=true, response_model_exclude_unset=false, response_model_exclude_defaults=false, response_model_exclude_none=false, include_in_schema=true, response_class=None, name=None, callbacks=None, openapi_extra=None, generate_unique_id_function=None))]
+    #[allow(unused_variables)]
+    fn get<'py>(
+        &self,
+        py: Python<'py>,
+        path: String,
+        response_model: Option<Py<PyAny>>,
+        status_code: Option<u16>,
+        tags: Option<Py<PyAny>>,
+        dependencies: Option<Py<PyAny>>,
+        summary: Option<String>,
+        description: Option<String>,
+        response_description: Option<String>,
+        responses: Option<Py<PyAny>>,
+        deprecated: Option<bool>,
+        operation_id: Option<String>,
+        response_model_include: Option<Py<PyAny>>,
+        response_model_exclude: Option<Py<PyAny>>,
+        response_model_by_alias: bool,
+        response_model_exclude_unset: bool,
+        response_model_exclude_defaults: bool,
+        response_model_exclude_none: bool,
+        include_in_schema: bool,
+        response_class: Option<Py<PyAny>>,
+        name: Option<String>,
+        callbacks: Option<Py<PyAny>>,
+        openapi_extra: Option<Py<PyAny>>,
+        generate_unique_id_function: Option<Py<PyAny>>,
+    ) -> PyResult<Py<PyAny>> {
+        self.router.bind(py).borrow().create_method_decorator(
+            py,
+            HttpMethod::GET,
+            path,
+            tags,
+            summary,
+            description,
+            deprecated,
+            include_in_schema,
+        )
+    }
+
+    #[pyo3(signature = (path, *, response_model=None, status_code=None, tags=None, dependencies=None, summary=None, description=None, response_description=None, responses=None, deprecated=None, operation_id=None, response_model_include=None, response_model_exclude=None, response_model_by_alias=true, response_model_exclude_unset=false, response_model_exclude_defaults=false, response_model_exclude_none=false, include_in_schema=true, response_class=None, name=None, callbacks=None, openapi_extra=None, generate_unique_id_function=None))]
+    #[allow(unused_variables)]
+    fn post<'py>(
+        &self,
+        py: Python<'py>,
+        path: String,
+        response_model: Option<Py<PyAny>>,
+        status_code: Option<u16>,
+        tags: Option<Py<PyAny>>,
+        dependencies: Option<Py<PyAny>>,
+        summary: Option<String>,
+        description: Option<String>,
+        response_description: Option<String>,
+        responses: Option<Py<PyAny>>,
+        deprecated: Option<bool>,
+        operation_id: Option<String>,
+        response_model_include: Option<Py<PyAny>>,
+        response_model_exclude: Option<Py<PyAny>>,
+        response_model_by_alias: bool,
+        response_model_exclude_unset: bool,
+        response_model_exclude_defaults: bool,
+        response_model_exclude_none: bool,
+        include_in_schema: bool,
+        response_class: Option<Py<PyAny>>,
+        name: Option<String>,
+        callbacks: Option<Py<PyAny>>,
+        openapi_extra: Option<Py<PyAny>>,
+        generate_unique_id_function: Option<Py<PyAny>>,
+    ) -> PyResult<Py<PyAny>> {
+        self.router.bind(py).borrow().create_method_decorator(
+            py,
+            HttpMethod::POST,
+            path,
+            tags,
+            summary,
+            description,
+            deprecated,
+            include_in_schema,
+        )
+    }
+
+    #[pyo3(signature = (path, *, response_model=None, status_code=None, tags=None, dependencies=None, summary=None, description=None, response_description=None, responses=None, deprecated=None, operation_id=None, response_model_include=None, response_model_exclude=None, response_model_by_alias=true, response_model_exclude_unset=false, response_model_exclude_defaults=false, response_model_exclude_none=false, include_in_schema=true, response_class=None, name=None, callbacks=None, openapi_extra=None, generate_unique_id_function=None))]
+    #[allow(unused_variables)]
+    fn put<'py>(
+        &self,
+        py: Python<'py>,
+        path: String,
+        response_model: Option<Py<PyAny>>,
+        status_code: Option<u16>,
+        tags: Option<Py<PyAny>>,
+        dependencies: Option<Py<PyAny>>,
+        summary: Option<String>,
+        description: Option<String>,
+        response_description: Option<String>,
+        responses: Option<Py<PyAny>>,
+        deprecated: Option<bool>,
+        operation_id: Option<String>,
+        response_model_include: Option<Py<PyAny>>,
+        response_model_exclude: Option<Py<PyAny>>,
+        response_model_by_alias: bool,
+        response_model_exclude_unset: bool,
+        response_model_exclude_defaults: bool,
+        response_model_exclude_none: bool,
+        include_in_schema: bool,
+        response_class: Option<Py<PyAny>>,
+        name: Option<String>,
+        callbacks: Option<Py<PyAny>>,
+        openapi_extra: Option<Py<PyAny>>,
+        generate_unique_id_function: Option<Py<PyAny>>,
+    ) -> PyResult<Py<PyAny>> {
+        self.router.bind(py).borrow().create_method_decorator(
+            py,
+            HttpMethod::PUT,
+            path,
+            tags,
+            summary,
+            description,
+            deprecated,
+            include_in_schema,
+        )
+    }
+
+    #[pyo3(signature = (path, *, response_model=None, status_code=None, tags=None, dependencies=None, summary=None, description=None, response_description=None, responses=None, deprecated=None, operation_id=None, response_model_include=None, response_model_exclude=None, response_model_by_alias=true, response_model_exclude_unset=false, response_model_exclude_defaults=false, response_model_exclude_none=false, include_in_schema=true, response_class=None, name=None, callbacks=None, openapi_extra=None, generate_unique_id_function=None))]
+    #[allow(unused_variables)]
+    fn delete<'py>(
+        &self,
+        py: Python<'py>,
+        path: String,
+        response_model: Option<Py<PyAny>>,
+        status_code: Option<u16>,
+        tags: Option<Py<PyAny>>,
+        dependencies: Option<Py<PyAny>>,
+        summary: Option<String>,
+        description: Option<String>,
+        response_description: Option<String>,
+        responses: Option<Py<PyAny>>,
+        deprecated: Option<bool>,
+        operation_id: Option<String>,
+        response_model_include: Option<Py<PyAny>>,
+        response_model_exclude: Option<Py<PyAny>>,
+        response_model_by_alias: bool,
+        response_model_exclude_unset: bool,
+        response_model_exclude_defaults: bool,
+        response_model_exclude_none: bool,
+        include_in_schema: bool,
+        response_class: Option<Py<PyAny>>,
+        name: Option<String>,
+        callbacks: Option<Py<PyAny>>,
+        openapi_extra: Option<Py<PyAny>>,
+        generate_unique_id_function: Option<Py<PyAny>>,
+    ) -> PyResult<Py<PyAny>> {
+        self.router.bind(py).borrow().create_method_decorator(
+            py,
+            HttpMethod::DELETE,
+            path,
+            tags,
+            summary,
+            description,
+            deprecated,
+            include_in_schema,
+        )
+    }
+
+    #[pyo3(signature = (path, *, response_model=None, status_code=None, tags=None, dependencies=None, summary=None, description=None, response_description=None, responses=None, deprecated=None, operation_id=None, response_model_include=None, response_model_exclude=None, response_model_by_alias=true, response_model_exclude_unset=false, response_model_exclude_defaults=false, response_model_exclude_none=false, include_in_schema=true, response_class=None, name=None, callbacks=None, openapi_extra=None, generate_unique_id_function=None))]
+    #[allow(unused_variables)]
+    fn patch<'py>(
+        &self,
+        py: Python<'py>,
+        path: String,
+        response_model: Option<Py<PyAny>>,
+        status_code: Option<u16>,
+        tags: Option<Py<PyAny>>,
+        dependencies: Option<Py<PyAny>>,
+        summary: Option<String>,
+        description: Option<String>,
+        response_description: Option<String>,
+        responses: Option<Py<PyAny>>,
+        deprecated: Option<bool>,
+        operation_id: Option<String>,
+        response_model_include: Option<Py<PyAny>>,
+        response_model_exclude: Option<Py<PyAny>>,
+        response_model_by_alias: bool,
+        response_model_exclude_unset: bool,
+        response_model_exclude_defaults: bool,
+        response_model_exclude_none: bool,
+        include_in_schema: bool,
+        response_class: Option<Py<PyAny>>,
+        name: Option<String>,
+        callbacks: Option<Py<PyAny>>,
+        openapi_extra: Option<Py<PyAny>>,
+        generate_unique_id_function: Option<Py<PyAny>>,
+    ) -> PyResult<Py<PyAny>> {
+        self.router.bind(py).borrow().create_method_decorator(
+            py,
+            HttpMethod::PATCH,
+            path,
+            tags,
+            summary,
+            description,
+            deprecated,
+            include_in_schema,
+        )
+    }
+
+    #[pyo3(signature = (path, *, response_model=None, status_code=None, tags=None, dependencies=None, summary=None, description=None, response_description=None, responses=None, deprecated=None, operation_id=None, response_model_include=None, response_model_exclude=None, response_model_by_alias=true, response_model_exclude_unset=false, response_model_exclude_defaults=false, response_model_exclude_none=false, include_in_schema=true, response_class=None, name=None, callbacks=None, openapi_extra=None, generate_unique_id_function=None))]
+    #[allow(unused_variables)]
+    fn options<'py>(
+        &self,
+        py: Python<'py>,
+        path: String,
+        response_model: Option<Py<PyAny>>,
+        status_code: Option<u16>,
+        tags: Option<Py<PyAny>>,
+        dependencies: Option<Py<PyAny>>,
+        summary: Option<String>,
+        description: Option<String>,
+        response_description: Option<String>,
+        responses: Option<Py<PyAny>>,
+        deprecated: Option<bool>,
+        operation_id: Option<String>,
+        response_model_include: Option<Py<PyAny>>,
+        response_model_exclude: Option<Py<PyAny>>,
+        response_model_by_alias: bool,
+        response_model_exclude_unset: bool,
+        response_model_exclude_defaults: bool,
+        response_model_exclude_none: bool,
+        include_in_schema: bool,
+        response_class: Option<Py<PyAny>>,
+        name: Option<String>,
+        callbacks: Option<Py<PyAny>>,
+        openapi_extra: Option<Py<PyAny>>,
+        generate_unique_id_function: Option<Py<PyAny>>,
+    ) -> PyResult<Py<PyAny>> {
+        self.router.bind(py).borrow().create_method_decorator(
+            py,
+            HttpMethod::OPTIONS,
+            path,
+            tags,
+            summary,
+            description,
+            deprecated,
+            include_in_schema,
+        )
+    }
+
+    #[pyo3(signature = (path, *, response_model=None, status_code=None, tags=None, dependencies=None, summary=None, description=None, response_description=None, responses=None, deprecated=None, operation_id=None, response_model_include=None, response_model_exclude=None, response_model_by_alias=true, response_model_exclude_unset=false, response_model_exclude_defaults=false, response_model_exclude_none=false, include_in_schema=true, response_class=None, name=None, callbacks=None, openapi_extra=None, generate_unique_id_function=None))]
+    #[allow(unused_variables)]
+    fn head<'py>(
+        &self,
+        py: Python<'py>,
+        path: String,
+        response_model: Option<Py<PyAny>>,
+        status_code: Option<u16>,
+        tags: Option<Py<PyAny>>,
+        dependencies: Option<Py<PyAny>>,
+        summary: Option<String>,
+        description: Option<String>,
+        response_description: Option<String>,
+        responses: Option<Py<PyAny>>,
+        deprecated: Option<bool>,
+        operation_id: Option<String>,
+        response_model_include: Option<Py<PyAny>>,
+        response_model_exclude: Option<Py<PyAny>>,
+        response_model_by_alias: bool,
+        response_model_exclude_unset: bool,
+        response_model_exclude_defaults: bool,
+        response_model_exclude_none: bool,
+        include_in_schema: bool,
+        response_class: Option<Py<PyAny>>,
+        name: Option<String>,
+        callbacks: Option<Py<PyAny>>,
+        openapi_extra: Option<Py<PyAny>>,
+        generate_unique_id_function: Option<Py<PyAny>>,
+    ) -> PyResult<Py<PyAny>> {
+        self.router.bind(py).borrow().create_method_decorator(
+            py,
+            HttpMethod::HEAD,
+            path,
+            tags,
+            summary,
+            description,
+            deprecated,
+            include_in_schema,
+        )
     }
 
     #[pyo3(signature = (path))]
-    fn post<'py>(&self, path: String, py: Python<'py>) -> PyResult<Py<PyAny>> {
-        self.create_decorator("POST", path, py)
-    }
-
-    #[pyo3(signature = (path))]
-    fn put<'py>(&self, path: String, py: Python<'py>) -> PyResult<Py<PyAny>> {
-        self.create_decorator("PUT", path, py)
-    }
-
-    #[pyo3(signature = (path))]
-    fn delete<'py>(&self, path: String, py: Python<'py>) -> PyResult<Py<PyAny>> {
-        self.create_decorator("DELETE", path, py)
-    }
-
-    #[pyo3(signature = (path))]
-    fn patch<'py>(&self, path: String, py: Python<'py>) -> PyResult<Py<PyAny>> {
-        self.create_decorator("PATCH", path, py)
-    }
-
-    #[pyo3(signature = (path))]
-    fn options<'py>(&self, path: String, py: Python<'py>) -> PyResult<Py<PyAny>> {
-        self.create_decorator("OPTIONS", path, py)
-    }
-
-    #[pyo3(signature = (path))]
-    fn head<'py>(&self, path: String, py: Python<'py>) -> PyResult<Py<PyAny>> {
-        self.create_decorator("HEAD", path, py)
-    }
-
-    // decorator for websockets: @app.websocket("/ws")
-    fn websocket<'py>(&self, path: String) -> PyResult<Py<PyAny>> {
-        if !path.starts_with('/') {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "WebSocket path must start with '/'",
-            ));
-        }
-        ws_decorator(path)
+    fn websocket(&self, py: Python<'_>, path: String) -> PyResult<Py<PyAny>> {
+        self.router.bind(py).borrow().create_ws_decorator(py, path)
     }
 
     // decorator for generic Python functions: @app.middleware("smtg")
@@ -278,48 +516,39 @@ impl FastrAPI {
         server::serve(py, host, port, slf)
     }
 
-    fn create_decorator<'py>(
+    #[pyo3(signature = (router, *, prefix="".to_string(), tags=None))]
+    fn include_router(
         &self,
-        method: &str,
-        path: String,
         py: Python<'_>,
-    ) -> PyResult<Py<PyAny>> {
-        let route_key = format!("{} {}", method, path);
-        let path_for_closure = path.clone();
+        router: Py<PyAPIRouter>,
+        prefix: String,
+        tags: Option<Py<PyAny>>,
+    ) -> PyResult<()> {
+        let base = self.router.bind(py);
+        let base_ref = base.borrow();
 
-        let decorator = move |args: &Bound<'_, PyTuple>,
-                              _kwargs: Option<&Bound<'_, PyDict>>|
-              -> PyResult<Py<PyAny>> {
-            let py = args.py();
-            let func: Py<PyAny> = args.get_item(0)?.unbind();
-            let metadata = parse_route_metadata(py, &func.bind(py), &path_for_closure);
-
-            let needs_kwargs = !metadata.path_param_names.is_empty()
-                || !metadata.query_param_names.is_empty()
-                || !metadata.body_param_names.is_empty()
-                || !metadata.param_validators.is_empty()
-                || !metadata.dependencies.is_empty()
-                || !metadata.parsed_params.is_empty();
-
-            let handler = Arc::new(RouteHandler {
-                func: func.clone_ref(py),
-                is_async: metadata.is_async,
-                is_fast_path: metadata.is_fast_path,
-                dependency_needs_request: metadata.dependency_needs_request,
-                needs_kwargs,
-                param_validators: metadata.param_validators,
-                response_type: metadata.response_type,
-                path_param_names: metadata.path_param_names,
-                query_param_names: metadata.query_param_names,
-                body_param_names: metadata.body_param_names,
-                dependencies: metadata.dependencies,
-                parsed_params: metadata.parsed_params,
-            });
-
-            ROUTES.pin().insert(route_key.clone(), handler);
-            Ok(func)
+        let tag_vec: Vec<String> = if let Some(ref tags_obj) = tags {
+            let tags_bound = tags_obj.bind(py);
+            if let Ok(iter) = tags_bound.try_iter() {
+                iter.filter_map(|item| item.ok()?.extract::<String>().ok())
+                    .collect()
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
         };
 
-        PyCFunction::new_closure(py, None, None, decorator).map(|f| f.into())
+        base_ref
+            .sub_routers
+            .lock()
+            .unwrap()
+            .push(crate::routing::types::SubRouterMount {
+                router: router,
+                prefix,
+                tags: tag_vec,
+            });
+
+        Ok(())
     }
 }

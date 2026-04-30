@@ -22,7 +22,6 @@ use tower_sessions::{Expiry, MemoryStore, SessionManagerLayer};
 
 // internal Imports
 use crate::ffi::py_handlers::{run_py_handler_no_args, run_py_handler_with_request};
-use crate::globals::{MIDDLEWARES, PYTHON_RUNTIME, ROUTES, WEBSOCKET_ROUTES};
 use crate::http::middleware::{
     build_cors_layer, parse_cors_params, parse_gzip_params, parse_session_params,
     parse_trusted_host_params, CORSMiddleware, GZipMiddleware, SessionMiddleware,
@@ -32,6 +31,11 @@ use crate::http::websocket::ws_handler;
 use crate::routing::types::{RequestInput, RouteHandler};
 use crate::utils::openapi::build_openapi_spec;
 use crate::utils::utils::local_guard;
+use crate::{
+    globals::{MIDDLEWARES, PYTHON_RUNTIME},
+    routing::types::HttpMethod,
+};
+use std::collections::HashMap;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -307,8 +311,8 @@ fn log_python_error(context: &str, err: PyErr) {
     Python::attach(|py| err.print(py));
 }
 
-fn parse_query_string(query: Option<&str>) -> std::collections::HashMap<String, String> {
-    let mut params = std::collections::HashMap::new();
+fn parse_query_string(query: Option<&str>) -> HashMap<String, String> {
+    let mut params = HashMap::new();
 
     let Some(query) = query else {
         return params;
@@ -328,8 +332,8 @@ fn parse_query_string(query: Option<&str>) -> std::collections::HashMap<String, 
     params
 }
 
-fn parse_cookie_header(cookie_header: Option<&str>) -> std::collections::HashMap<String, String> {
-    let mut cookies = std::collections::HashMap::new();
+fn parse_cookie_header(cookie_header: Option<&str>) -> HashMap<String, String> {
+    let mut cookies = HashMap::new();
 
     let Some(cookie_header) = cookie_header else {
         return cookies;
@@ -348,10 +352,7 @@ fn parse_cookie_header(cookie_header: Option<&str>) -> std::collections::HashMap
     cookies
 }
 
-fn build_request_input(
-    request: &Request,
-    path_params: std::collections::HashMap<String, String>,
-) -> RequestInput {
+fn build_request_input(request: &Request, path_params: HashMap<String, String>) -> RequestInput {
     let query_string = request.uri().query().unwrap_or("").to_string();
     let headers = request
         .headers()
@@ -362,7 +363,7 @@ fn build_request_input(
                 .ok()
                 .map(|value| (name.as_str().to_ascii_lowercase(), value.to_string()))
         })
-        .collect::<std::collections::HashMap<_, _>>();
+        .collect::<HashMap<_, _>>();
 
     let cookies = parse_cookie_header(
         request
@@ -508,48 +509,28 @@ fn build_router(
         &mut session_config,
     );
 
-    // Route registration
-    let guard = local_guard(&*ROUTES);
-    for entry in ROUTES.iter(&guard) {
-        let (route_key, handler) = entry;
-        let parts: Vec<&str> = route_key.splitn(2, ' ').collect();
-        if parts.len() != 2 {
-            continue;
-        }
-        let method = parts[0];
-        let path = parts[1].to_string();
+    let base_router = app_config.router.bind(py);
+    let base_ref = base_router.borrow();
+    let (routes, ws_routes) = base_ref.flatten(py);
+
+    for route in routes {
         app = register_route(
             app,
-            method,
-            path,
-            route_key.as_str().into(),
-            handler.as_ref(),
+            route.method,
+            route.path,
+            route.handler,
             app_state.clone(),
         );
     }
 
-    // Websockets
-    for (key, _value) in WEBSOCKET_ROUTES.pin().iter() {
-        let parts: Vec<&str> = key.splitn(2, ' ').collect();
-        if parts.len() != 2 || parts[0] != "WS" {
-            continue;
-        }
-        let path = parts[1].to_string();
-        let route_key = Arc::new(key.clone());
-
-        app = app.route(
-            &path,
-            get({
-                let rt_handle = app_state.rt_handle.clone();
-                move |ws| ws_handler(ws, Extension(route_key.clone()), Extension(rt_handle))
-            }),
-        );
+    for ws in ws_routes {
+        app = register_ws_route(app, ws.path, ws.handler, app_state.clone());
     }
 
     // OpenAPI
     let openapi_json = Arc::new(build_openapi_spec(
         py,
-        &*ROUTES,
+        &base_ref,
         &app_config.title,
         &app_config.version,
         &app_config.description,
@@ -674,92 +655,99 @@ fn build_router(
 // Helper
 fn register_route(
     app: Router,
-    method: &str,
+    method: HttpMethod,
     path: String,
-    route_key: Arc<str>,
-    handler: &RouteHandler,
+    handler: Arc<RouteHandler>,
     _state: AppState,
 ) -> Router {
     let has_path_params = !handler.path_param_names.is_empty();
     let needs_request_context = handler.needs_kwargs;
     let expects_body = !handler.body_param_names.is_empty() || !handler.param_validators.is_empty();
-
     if !needs_request_context {
-        let route_key_clone = Arc::clone(&route_key);
-        let handler = move |Extension(state): Extension<AppState>,
-                            ConnectInfo(_addr): ConnectInfo<SocketAddr>| {
-            let route_key = Arc::clone(&route_key_clone);
-            async move { run_py_handler_no_args(state.rt_handle, route_key).await }
-        };
+        let handler_clone = handler.clone();
 
-        return match method {
-            "GET" => app.route(&path, get(handler)),
-            "HEAD" => app.route(&path, head(handler)),
-            "OPTIONS" => app.route(&path, options(handler)),
-            "POST" => app.route(&path, post(handler)),
-            "PUT" => app.route(&path, put(handler)),
-            "DELETE" => app.route(&path, delete(handler)),
-            "PATCH" => app.route(&path, patch(handler)),
-            _ => app,
-        };
-    }
-
-    if has_path_params {
-        let route_key_clone = Arc::clone(&route_key);
-        let request_handler =
-            move |Path(path_params): Path<std::collections::HashMap<String, String>>,
-                  Extension(state): Extension<AppState>,
-                  ConnectInfo(_addr): ConnectInfo<SocketAddr>,
-                  request: Request| {
-                let route_key = Arc::clone(&route_key_clone);
-                async move {
-                    let request_input = build_request_input(&request, path_params);
-                    let payload = match extract_payload(request, expects_body).await {
-                        Ok(payload) => payload,
-                        Err(response) => return response,
-                    };
-
-                    run_py_handler_with_request(state.rt_handle, route_key, request_input, payload)
-                        .await
-                }
+        let route_handler =
+            move |Extension(state): Extension<AppState>,
+                  ConnectInfo(_addr): ConnectInfo<SocketAddr>| {
+                let handler = handler_clone.clone();
+                async move { run_py_handler_no_args(state.rt_handle, handler).await }
             };
 
         return match method {
-            "GET" => app.route(&path, get(request_handler)),
-            "HEAD" => app.route(&path, head(request_handler)),
-            "OPTIONS" => app.route(&path, options(request_handler)),
-            "POST" => app.route(&path, post(request_handler)),
-            "PUT" => app.route(&path, put(request_handler)),
-            "DELETE" => app.route(&path, delete(request_handler)),
-            "PATCH" => app.route(&path, patch(request_handler)),
-            _ => app,
+            HttpMethod::GET => app.route(&path, get(route_handler)),
+            HttpMethod::POST => app.route(&path, post(route_handler)),
+            HttpMethod::PUT => app.route(&path, put(route_handler)),
+            HttpMethod::DELETE => app.route(&path, delete(route_handler)),
+            HttpMethod::PATCH => app.route(&path, patch(route_handler)),
+            HttpMethod::OPTIONS => app.route(&path, options(route_handler)),
+            HttpMethod::HEAD => app.route(&path, head(route_handler)),
+        };
+    }
+    if has_path_params {
+        let handler_clone = handler.clone();
+
+        let route_handler = move |Path(path_params): Path<HashMap<String, String>>,
+                                  Extension(state): Extension<AppState>,
+                                  ConnectInfo(_addr): ConnectInfo<SocketAddr>,
+                                  request: Request| {
+            let handler = handler_clone.clone();
+
+            async move {
+                let request_input = build_request_input(&request, path_params);
+
+                let payload = match extract_payload(request, expects_body).await {
+                    Ok(payload) => payload,
+                    Err(response) => return response,
+                };
+
+                run_py_handler_with_request(state.rt_handle, handler, request_input, payload).await
+            }
+        };
+
+        return match method {
+            HttpMethod::GET => app.route(&path, get(route_handler)),
+            HttpMethod::POST => app.route(&path, post(route_handler)),
+            HttpMethod::PUT => app.route(&path, put(route_handler)),
+            HttpMethod::DELETE => app.route(&path, delete(route_handler)),
+            HttpMethod::PATCH => app.route(&path, patch(route_handler)),
+            HttpMethod::OPTIONS => app.route(&path, options(route_handler)),
+            HttpMethod::HEAD => app.route(&path, head(route_handler)),
         };
     }
 
-    let route_key_clone = Arc::clone(&route_key);
-    let request_handler = move |Extension(state): Extension<AppState>,
-                                ConnectInfo(_addr): ConnectInfo<SocketAddr>,
-                                request: Request| {
-        let route_key = Arc::clone(&route_key_clone);
+    let handler_clone = handler.clone();
+    let route_handler = move |Extension(state): Extension<AppState>,
+                              ConnectInfo(_addr): ConnectInfo<SocketAddr>,
+                              request: Request| {
+        let handler = handler_clone.clone();
         async move {
-            let request_input = build_request_input(&request, std::collections::HashMap::new());
+            let request_input = build_request_input(&request, HashMap::new());
+
             let payload = match extract_payload(request, expects_body).await {
                 Ok(payload) => payload,
                 Err(response) => return response,
             };
-
-            run_py_handler_with_request(state.rt_handle, route_key, request_input, payload).await
+            run_py_handler_with_request(state.rt_handle, handler, request_input, payload).await
         }
     };
 
     match method {
-        "GET" => app.route(&path, get(request_handler)),
-        "HEAD" => app.route(&path, head(request_handler)),
-        "OPTIONS" => app.route(&path, options(request_handler)),
-        "POST" => app.route(&path, post(request_handler)),
-        "PUT" => app.route(&path, put(request_handler)),
-        "DELETE" => app.route(&path, delete(request_handler)),
-        "PATCH" => app.route(&path, patch(request_handler)),
-        _ => app,
+        HttpMethod::GET => app.route(&path, get(route_handler)),
+        HttpMethod::POST => app.route(&path, post(route_handler)),
+        HttpMethod::PUT => app.route(&path, put(route_handler)),
+        HttpMethod::DELETE => app.route(&path, delete(route_handler)),
+        HttpMethod::PATCH => app.route(&path, patch(route_handler)),
+        HttpMethod::OPTIONS => app.route(&path, options(route_handler)),
+        HttpMethod::HEAD => app.route(&path, head(route_handler)),
     }
+}
+
+fn register_ws_route(app: Router, path: String, handler: Py<PyAny>, app_state: AppState) -> Router {
+    app.route(
+        &path,
+        get({
+            let rt_handle = app_state.rt_handle.clone();
+            move |ws| ws_handler(ws, Extension(handler.clone()), Extension(rt_handle.clone()))
+        }),
+    )
 }

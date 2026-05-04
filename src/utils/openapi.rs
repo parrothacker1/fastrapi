@@ -438,9 +438,9 @@ fn collect_routes(
     py: Python<'_>,
     router: &PyAPIRouter,
 ) -> Vec<(String, HttpMethod, Arc<RouteHandler>, Vec<String>)> {
-    let (routes, _ws) = router.flatten(py);
-    routes
-        .into_iter()
-        .map(|r| (r.path, r.method, r.handler, r.tags))
+    let flat = router.flatten(py);
+    flat.0
+        .iter()
+        .map(|r| (r.path.clone(), r.method, r.handler.clone(), r.tags.clone()))
         .collect()
 }

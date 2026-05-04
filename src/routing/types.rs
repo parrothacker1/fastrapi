@@ -1,6 +1,7 @@
 use crate::router::PyAPIRouter;
 use crate::routing::dependencies::DependencyNode;
 use crate::types::response::ResponseType;
+use pyo3::types::PyString;
 use pyo3::{Py, PyAny};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -89,9 +90,9 @@ pub struct RouteHandler {
     pub param_validators: Vec<(String, Py<PyAny>)>,
     pub response_type: ResponseType,
     pub needs_kwargs: bool,
-    pub path_param_names: Vec<String>,
-    pub query_param_names: Vec<String>,
-    pub body_param_names: Vec<String>,
+    pub path_param_names: Vec<Py<PyString>>,
+    pub query_param_names: Vec<Py<PyString>>,
+    pub body_param_names: Vec<Py<PyString>>,
     pub dependencies: Vec<DependencyNode>,
     pub parsed_params: Vec<ParsedParameter>,
 }

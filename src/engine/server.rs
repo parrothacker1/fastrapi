@@ -1,7 +1,7 @@
 use super::types::FastrAPI;
 use axum::{
     body::to_bytes,
-    extract::{ConnectInfo, Extension, Path, Request},
+    extract::{Extension, Request},
     http::StatusCode,
     middleware::{self as axum_middleware, Next},
     response::{Html, IntoResponse, Response},
@@ -21,19 +21,25 @@ use tower_sessions::cookie::Key;
 use tower_sessions::{Expiry, MemoryStore, SessionManagerLayer};
 
 // internal Imports
-use crate::ffi::py_handlers::{run_py_handler_no_args, run_py_handler_with_request};
-use crate::http::middleware::{
-    build_cors_layer, parse_cors_params, parse_gzip_params, parse_session_params,
-    parse_trusted_host_params, CORSMiddleware, GZipMiddleware, SessionMiddleware,
-    TrustedHostMiddleware,
-};
 use crate::http::websocket::ws_handler;
-use crate::routing::types::{RequestInput, RouteHandler};
+use crate::routing::types::RequestInput;
 use crate::utils::openapi::build_openapi_spec;
 use crate::utils::utils::local_guard;
 use crate::{
+    ffi::py_handlers::{run_py_handler_no_args, run_py_handler_with_request},
+    routing::router::{FrozenRouter, FrozenRouterBuilder},
+};
+use crate::{
     globals::{MIDDLEWARES, PYTHON_RUNTIME},
     routing::types::HttpMethod,
+};
+use crate::{
+    http::middleware::{
+        build_cors_layer, parse_cors_params, parse_gzip_params, parse_session_params,
+        parse_trusted_host_params, CORSMiddleware, GZipMiddleware, SessionMiddleware,
+        TrustedHostMiddleware,
+    },
+    routing::router::RouteMatch,
 };
 use std::collections::HashMap;
 
@@ -511,24 +517,31 @@ fn build_router(
 
     let base_router = app_config.router.bind(py);
     let base_ref = base_router.borrow();
-    let (routes, ws_routes) = base_ref.flatten(py);
     base_ref.freeze(py);
+    let flat = base_ref.flatten(py);
 
-    for route in routes {
-        app = register_route(
-            app,
-            route.method,
-            route.path,
-            route.handler,
-            app_state.clone(),
+    let mut frozen_router_builder = FrozenRouterBuilder::new();
+    for route in &flat.0 {
+        frozen_router_builder.add_route(route.method, route.path.clone(), route.handler.clone());
+    }
+    let frozen_router = Arc::new(frozen_router_builder.build());
+
+    for ws in &flat.1 {
+        let path = ws.path.clone();
+        let handler = ws.handler.clone_ref(py);
+        let rt_handle = app_state.rt_handle.clone();
+        app = app.route(
+            &path,
+            get(move |ws_upgrade| {
+                ws_handler(
+                    ws_upgrade,
+                    Extension(handler.clone()),
+                    Extension(rt_handle.clone()),
+                )
+            }),
         );
     }
 
-    for ws in ws_routes {
-        app = register_ws_route(app, ws.path, ws.handler, app_state.clone());
-    }
-
-    // OpenAPI
     let openapi_json = Arc::new(build_openapi_spec(
         py,
         &base_ref,
@@ -547,13 +560,18 @@ fn build_router(
             }
         }),
     );
-
     if let Some(docs) = docs_url {
         app = app.route(
             &docs,
             get(|| async { Html(include_str!("../../static/swagger-ui.html")) }),
         );
     }
+
+    app = app.fallback({
+        let router = frozen_router.clone();
+        let state = app_state.clone();
+        axum::routing::any(move |req: Request| async move { dispatch(router, state, req).await })
+    });
 
     // =========================== //
     // ==== LAYER APPLICATION ==== //
@@ -563,7 +581,6 @@ fn build_router(
     if let Some(config) = session_config {
         info!("🍪 Layer: Sessions");
         let key = Key::from(config.secret_key.as_bytes());
-
         let store = MemoryStore::default();
 
         let layer = SessionManagerLayer::new(store)
@@ -585,7 +602,7 @@ fn build_router(
 
     // L2: GZip
     if let Some(config) = gzip_config {
-        info!("🗜️ Layer: GZip (min: {} bytes)", config.minimum_size);
+        info!("🗜️  Layer: GZip (min: {} bytes)", config.minimum_size);
         let predicate = SizeAbove::new(config.minimum_size as u16);
         app = app.layer(CompressionLayer::new().compress_when(predicate));
     }
@@ -597,7 +614,6 @@ fn build_router(
         let guard = local_guard(&*MIDDLEWARES);
         for (_key, middleware_ref) in MIDDLEWARES.iter(&guard) {
             let middleware = middleware_ref.clone();
-
             app = app.layer(axum_middleware::from_fn(move |req, next| {
                 let middleware = middleware.clone();
                 async move {
@@ -609,11 +625,9 @@ fn build_router(
 
     // L4: CORS
     if let Some(config) = cors_config {
-        info!("🛡️ Layer: CORS");
+        info!("🛡️  Layer: CORS");
         match build_cors_layer(&config) {
-            Ok(layer) => {
-                app = app.layer(layer);
-            }
+            Ok(layer) => app = app.layer(layer),
             Err(e) => eprintln!("Error building CORS layer: {:?}", e),
         }
     }
@@ -653,102 +667,49 @@ fn build_router(
     app.layer(Extension(app_state))
 }
 
-// Helper
-fn register_route(
-    app: Router,
-    method: HttpMethod,
-    path: String,
-    handler: Arc<RouteHandler>,
-    _state: AppState,
-) -> Router {
-    let has_path_params = !handler.path_param_names.is_empty();
-    let needs_request_context = handler.needs_kwargs;
-    let expects_body = !handler.body_param_names.is_empty() || !handler.param_validators.is_empty();
-    if !needs_request_context {
-        let handler_clone = handler.clone();
-
-        let route_handler =
-            move |Extension(state): Extension<AppState>,
-                  ConnectInfo(_addr): ConnectInfo<SocketAddr>| {
-                let handler = handler_clone.clone();
-                async move { run_py_handler_no_args(state.rt_handle, handler).await }
-            };
-
-        return match method {
-            HttpMethod::GET => app.route(&path, get(route_handler)),
-            HttpMethod::POST => app.route(&path, post(route_handler)),
-            HttpMethod::PUT => app.route(&path, put(route_handler)),
-            HttpMethod::DELETE => app.route(&path, delete(route_handler)),
-            HttpMethod::PATCH => app.route(&path, patch(route_handler)),
-            HttpMethod::OPTIONS => app.route(&path, options(route_handler)),
-            HttpMethod::HEAD => app.route(&path, head(route_handler)),
-        };
-    }
-    if has_path_params {
-        let handler_clone = handler.clone();
-
-        let route_handler = move |Path(path_params): Path<HashMap<String, String>>,
-                                  Extension(state): Extension<AppState>,
-                                  ConnectInfo(_addr): ConnectInfo<SocketAddr>,
-                                  request: Request| {
-            let handler = handler_clone.clone();
-
-            async move {
-                let request_input = build_request_input(&request, path_params);
-
-                let payload = match extract_payload(request, expects_body).await {
-                    Ok(payload) => payload,
-                    Err(response) => return response,
-                };
-
-                run_py_handler_with_request(state.rt_handle, handler, request_input, payload).await
-            }
-        };
-
-        return match method {
-            HttpMethod::GET => app.route(&path, get(route_handler)),
-            HttpMethod::POST => app.route(&path, post(route_handler)),
-            HttpMethod::PUT => app.route(&path, put(route_handler)),
-            HttpMethod::DELETE => app.route(&path, delete(route_handler)),
-            HttpMethod::PATCH => app.route(&path, patch(route_handler)),
-            HttpMethod::OPTIONS => app.route(&path, options(route_handler)),
-            HttpMethod::HEAD => app.route(&path, head(route_handler)),
-        };
-    }
-
-    let handler_clone = handler.clone();
-    let route_handler = move |Extension(state): Extension<AppState>,
-                              ConnectInfo(_addr): ConnectInfo<SocketAddr>,
-                              request: Request| {
-        let handler = handler_clone.clone();
-        async move {
-            let request_input = build_request_input(&request, HashMap::new());
-
-            let payload = match extract_payload(request, expects_body).await {
-                Ok(payload) => payload,
-                Err(response) => return response,
-            };
-            run_py_handler_with_request(state.rt_handle, handler, request_input, payload).await
-        }
+async fn dispatch(router: Arc<FrozenRouter>, state: AppState, req: Request) -> Response {
+    let method = match *req.method() {
+        axum::http::Method::GET => HttpMethod::GET,
+        axum::http::Method::POST => HttpMethod::POST,
+        axum::http::Method::PUT => HttpMethod::PUT,
+        axum::http::Method::DELETE => HttpMethod::DELETE,
+        axum::http::Method::PATCH => HttpMethod::PATCH,
+        axum::http::Method::OPTIONS => HttpMethod::OPTIONS,
+        axum::http::Method::HEAD => HttpMethod::HEAD,
+        _ => return axum::http::StatusCode::METHOD_NOT_ALLOWED.into_response(),
+    };
+    let path = req.uri().path();
+    let route_match = match router.resolve(method, path) {
+        Some(v) => v,
+        None => return axum::http::StatusCode::NOT_FOUND.into_response(),
     };
 
-    match method {
-        HttpMethod::GET => app.route(&path, get(route_handler)),
-        HttpMethod::POST => app.route(&path, post(route_handler)),
-        HttpMethod::PUT => app.route(&path, put(route_handler)),
-        HttpMethod::DELETE => app.route(&path, delete(route_handler)),
-        HttpMethod::PATCH => app.route(&path, patch(route_handler)),
-        HttpMethod::OPTIONS => app.route(&path, options(route_handler)),
-        HttpMethod::HEAD => app.route(&path, head(route_handler)),
+    let (handler, params_iter) = match route_match {
+        RouteMatch::Static(handler) => (handler, None),
+        RouteMatch::Params(handler, params) => (handler, Some(params)),
+    };
+    if !handler.needs_kwargs {
+        return run_py_handler_no_args(state.rt_handle, handler).await;
     }
-}
+    let path_params = if let Some(params) = params_iter {
+        params
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    } else {
+        HashMap::new()
+    };
 
-fn register_ws_route(app: Router, path: String, handler: Py<PyAny>, app_state: AppState) -> Router {
-    app.route(
-        &path,
-        get({
-            let rt_handle = app_state.rt_handle.clone();
-            move |ws| ws_handler(ws, Extension(handler.clone()), Extension(rt_handle.clone()))
-        }),
-    )
+    let expects_body = !handler.body_param_names.is_empty() || !handler.param_validators.is_empty();
+
+    let request_input = build_request_input(&req, path_params);
+    let payload = if !expects_body {
+        None
+    } else {
+        match extract_payload(req, true).await {
+            Ok(p) => p,
+            Err(resp) => return resp,
+        }
+    };
+    run_py_handler_with_request(state.rt_handle, handler, request_input, payload).await
 }

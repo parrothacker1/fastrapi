@@ -31,7 +31,7 @@ pub struct PyAPIRouter {
     pub websocket_entries: Arc<Mutex<Vec<WebSocketEntry>>>,
     pub sub_routers: Arc<Mutex<Vec<SubRouterMount>>>,
     pub frozen: Arc<AtomicBool>,
-    pub cached_flat: Arc<Mutex<Option<(Vec<FlatRoute>, Vec<FlatWebSocket>)>>>,
+    pub cached_flat: Arc<Mutex<Option<Arc<(Vec<FlatRoute>, Vec<FlatWebSocket>)>>>>,
 }
 
 impl PyAPIRouter {
@@ -154,29 +154,27 @@ impl PyAPIRouter {
         };
         PyCFunction::new_closure(py, None, None, closure).map(|f| f.into())
     }
+    fn mark_frozen(&self) {
+        self.frozen.store(true, Ordering::Release);
+    }
     pub fn freeze(&self, py: Python<'_>) {
-        if self.frozen.load(Ordering::Relaxed) {
+        if self.frozen.load(Ordering::Acquire) {
             return;
         }
-
-        let flat = flatten_router(py, self);
-
+        let flat = Arc::new(flatten_router(py, self));
         *self.cached_flat.lock().unwrap() = Some(flat);
-
-        self.frozen.store(true, Ordering::Relaxed);
+        self.mark_frozen();
     }
-    pub fn flatten(&self, py: Python<'_>) -> (Vec<FlatRoute>, Vec<FlatWebSocket>) {
-        if self.frozen.load(Ordering::Relaxed) {
-            return self
-                .cached_flat
-                .lock()
-                .unwrap()
-                .as_ref()
-                .expect("Router frozen but no cache")
-                .clone();
+
+    pub fn flatten(&self, py: Python<'_>) -> Arc<(Vec<FlatRoute>, Vec<FlatWebSocket>)> {
+        if self.frozen.load(Ordering::Acquire) {
+            if let Some(cached) = self.cached_flat.lock().unwrap().as_ref() {
+                return cached.clone();
+            }
+            return Arc::new(flatten_router(py, self));
         }
 
-        flatten_router(py, self)
+        Arc::new(flatten_router(py, self))
     }
 }
 
@@ -555,6 +553,7 @@ fn flatten_router(py: Python<'_>, root: &PyAPIRouter) -> (Vec<FlatRoute>, Vec<Fl
     let mut stack = vec![(root.clone(), String::new(), Vec::<String>::new())];
 
     while let Some((router, prefix, parent_tags)) = stack.pop() {
+        router.mark_frozen();
         let router_prefix = router.prefix.clone();
         let full_prefix = join_path(&prefix, &router_prefix);
 

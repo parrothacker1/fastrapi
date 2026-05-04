@@ -8,6 +8,7 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
+use pyo3::intern;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use std::sync::Arc;
@@ -24,34 +25,34 @@ fn python_error_to_response(py: Python<'_>, err: PyErr) -> Response {
 
 fn create_request_object(py: Python<'_>, request_input: &RequestInput) -> PyResult<Py<PyAny>> {
     let scope = PyDict::new(py);
-    scope.set_item("type", "http")?;
-    scope.set_item("method", request_input.method.as_str())?;
-    scope.set_item("path", request_input.path.as_str())?;
-    scope.set_item("query_string", request_input.query_string.as_str())?;
+    scope.set_item(intern!(py, "type"), intern!(py, "http"))?;
+    scope.set_item(intern!(py, "method"), request_input.method.as_str())?;
+    scope.set_item(intern!(py, "path"), request_input.path.as_str())?;
+    scope.set_item(intern!(py, "query_string"), request_input.query_string.as_str())?;
 
     let path_params = PyDict::new(py);
     for (key, value) in &request_input.path_params {
         path_params.set_item(key, value)?;
     }
-    scope.set_item("path_params", path_params)?;
+    scope.set_item(intern!(py, "path_params"), path_params)?;
 
     let query_params = PyDict::new(py);
     for (key, value) in &request_input.query_params {
         query_params.set_item(key, value)?;
     }
-    scope.set_item("query_params", query_params)?;
+    scope.set_item(intern!(py, "query_params"), query_params)?;
 
     let headers = PyDict::new(py);
     for (key, value) in &request_input.headers {
         headers.set_item(key, value)?;
     }
-    scope.set_item("headers", headers)?;
+    scope.set_item(intern!(py, "headers"), headers)?;
 
     let cookies = PyDict::new(py);
     for (key, value) in &request_input.cookies {
         cookies.set_item(key, value)?;
     }
-    scope.set_item("cookies", cookies)?;
+    scope.set_item(intern!(py, "cookies"), cookies)?;
 
     let py_request = PyRequest::from_scope(py, scope.into_any().unbind());
     Ok(Py::new(py, py_request)?.into_any())

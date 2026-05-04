@@ -143,9 +143,9 @@ pub fn register_pydantic_integration(m: &Bound<'_, PyModule>) -> PyResult<()> {
 pub struct ParsedRouteMetadata {
     pub param_validators: Vec<(String, Py<PyAny>)>,
     pub response_type: ResponseType,
-    pub path_param_names: Vec<String>,
-    pub query_param_names: Vec<String>,
-    pub body_param_names: Vec<String>,
+    pub path_param_names: Vec<Py<PyString>>,
+    pub query_param_names: Vec<Py<PyString>>,
+    pub body_param_names: Vec<Py<PyString>>,
     pub dependencies: Vec<DependencyNode>,
     pub dependency_needs_request: bool,
     pub parsed_params: Vec<ParsedParameter>,
@@ -164,8 +164,8 @@ pub fn parse_route_metadata(py: Python, func: &Bound<PyAny>, path: &str) -> Pars
         .unwrap_or(false);
 
     let path_param_names = params::extract_path_param_names(path);
-    let dependencies = dependencies::parse_dependencies(py, func, &path_param_names)
-        .unwrap_or_default();
+    let dependencies =
+        dependencies::parse_dependencies(py, func, &path_param_names).unwrap_or_default();
 
     let dependency_needs_request = dependencies.iter().any(|dep| dep.needs_request_object);
     let dep_param_names: HashSet<String> = dependencies
@@ -197,12 +197,8 @@ pub fn parse_route_metadata(py: Python, func: &Bound<PyAny>, path: &str) -> Pars
                 continue;
             }
 
-            let mut parsed_param = params::parse_parameter_spec(
-                py,
-                &param_name,
-                &param_obj,
-                &path_param_names,
-            )?;
+            let mut parsed_param =
+                params::parse_parameter_spec(py, &param_name, &param_obj, &path_param_names)?;
 
             if !parsed_param.is_pydantic_model {
                 if let Some(ann) = &parsed_param.annotation {
@@ -229,6 +225,16 @@ pub fn parse_route_metadata(py: Python, func: &Bound<PyAny>, path: &str) -> Pars
     })();
 
     let is_fast_path = parsed_params.is_empty() && dependencies.is_empty() && !is_async;
+
+    let intern_all = |names: Vec<String>| -> Vec<Py<PyString>> {
+        names
+            .into_iter()
+            .map(|n| PyString::new(py, &n).unbind())
+            .collect()
+    };
+    let path_param_names = intern_all(path_param_names);
+    let query_param_names = intern_all(query_param_names);
+    let body_param_names = intern_all(body_param_names);
 
     ParsedRouteMetadata {
         param_validators,
@@ -434,11 +440,10 @@ fn apply_body_and_validation(
     payload: Option<&serde_json::Value>,
     kwargs: &Bound<'_, PyDict>,
 ) -> Result<(), Response> {
-    // Build a set once — O(1) lookups below instead of O(n) linear scans.
     let known_body_params: HashSet<&str> = handler
         .body_param_names
         .iter()
-        .map(String::as_str)
+        .filter_map(|s| s.bind(py).to_str().ok())
         .chain(handler.param_validators.iter().map(|(n, _)| n.as_str()))
         .collect();
 
@@ -465,7 +470,7 @@ fn apply_body_and_validation(
                     .as_ref()
                     .map(|d| d.clone_ref(py))
                     .unwrap_or_else(|| py.None());
-                kwargs.set_item(param.name.as_str(), value).ok();
+                kwargs.set_item(param.name_py.bind(py), value).ok();
             }
         }
         return Ok(());
@@ -482,12 +487,12 @@ fn apply_body_and_validation(
                 .map(|(_, v)| v.bind(py))
                 .ok_or_else(|| validation_error_response("Body validator is not registered"))?;
             let validated = validate_with_pydantic(py, &validator, payload)?;
-            kwargs.set_item(param.name.as_str(), validated).ok();
+            kwargs.set_item(param.name_py.bind(py), validated).ok();
             return Ok(());
         }
 
         kwargs
-            .set_item(param.name.as_str(), json_to_py_object(py, payload))
+            .set_item(param.name_py.bind(py), json_to_py_object(py, payload))
             .ok();
         return Ok(());
     }
@@ -510,10 +515,10 @@ fn apply_body_and_validation(
                     .map(|(_, v)| v.bind(py))
                     .ok_or_else(|| validation_error_response("Body validator is not registered"))?;
                 let validated = validate_with_pydantic(py, &validator, value)?;
-                kwargs.set_item(param.name.as_str(), validated).ok();
+                kwargs.set_item(param.name_py.bind(py), validated).ok();
             } else {
                 kwargs
-                    .set_item(param.name.as_str(), json_to_py_object(py, value))
+                    .set_item(param.name_py.bind(py), json_to_py_object(py, value))
                     .ok();
             }
             continue;
@@ -525,7 +530,7 @@ fn apply_body_and_validation(
                 .as_ref()
                 .map(|d| d.clone_ref(py))
                 .unwrap_or_else(|| py.None());
-            kwargs.set_item(param.name.as_str(), default_value).ok();
+            kwargs.set_item(param.name_py.bind(py), default_value).ok();
         } else if param.required {
             return Err(validation_error_response(format!(
                 "Missing field: {}",
@@ -547,7 +552,7 @@ pub fn apply_request_data(
     let body_set: HashSet<&str> = handler
         .body_param_names
         .iter()
-        .map(String::as_str)
+        .filter_map(|s| s.bind(py).to_str().ok())
         .chain(handler.param_validators.iter().map(|(n, _)| n.as_str()))
         .collect();
 
@@ -556,7 +561,7 @@ pub fn apply_request_data(
             continue;
         }
         if let Some(value) = resolve_parameter_value(py, param, request_input)? {
-            kwargs.set_item(param.name.as_str(), value).ok();
+            kwargs.set_item(param.name_py.bind(py), value).ok();
         }
     }
 

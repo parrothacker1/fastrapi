@@ -57,6 +57,7 @@ pub struct ParameterConstraints {
 #[derive(Clone, Debug)]
 pub struct ParsedParameter {
     pub name: String,
+    pub name_py: Py<PyString>,
     pub external_name: String,
     pub source: ParameterSource,
     pub annotation: Option<Py<PyAny>>,
